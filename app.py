@@ -1,3 +1,4 @@
+%%writefile app.py
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -11,6 +12,7 @@ import io
 import os
 import pandas as pd
 import datetime
+import torchxrayvision as xrv
 
 # ---------------------------------------------------------
 # Page & PACS UI Setup
@@ -55,13 +57,13 @@ st.markdown("""
     <div>
         <span class="badge badge-success">● PACS Connected</span>
         <span class="badge badge-success">● Grad-CAM Active</span>
-        <span class="badge badge-success">● Sub-Classifier: Online</span>
+        <span class="badge badge-success">● XRV Sub-Classifier: Online</span>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# Pure PyTorch Model Loader & Preprocessing
+# Model Loaders (EfficientNet + TorchXRayVision)
 # ---------------------------------------------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 WEIGHTS_PATH = "/content/drive/MyDrive/PneuSight_Hackathon/efficientnet_b0_rsna.pth"
@@ -74,7 +76,7 @@ eval_transform = transforms.Compose([
 
 @st.cache_resource
 def load_classifier():
-    """Builds model architecture and loads saved .pth weights."""
+    """Builds primary model architecture and loads saved .pth weights."""
     model = models.efficientnet_b0(weights=None)
     in_features = model.classifier[1].in_features
 
@@ -99,7 +101,16 @@ def load_classifier():
     model.eval()
     return model
 
+@st.cache_resource
+def load_xrv_model():
+    """Loads pre-trained multi-pathology DenseNet-121 from TorchXRayVision."""
+    model = xrv.models.DenseNet(weights="densenet121-res224-all")
+    model.to(DEVICE)
+    model.eval()
+    return model
+
 classifier_model = load_classifier()
+xrv_model = load_xrv_model()
 
 # ---------------------------------------------------------
 # Grad-CAM Implementation Class
@@ -152,7 +163,7 @@ grad_cam_engine = GradCAM(classifier_model, classifier_model.features[-1])
 st.sidebar.markdown("### ⚙️ Engine Settings")
 selected_model = st.sidebar.selectbox(
     "Backbone Architecture",
-    ["EfficientNet-B0 (Primary)", "ResNet50 Deep-Feature", "Baseline CNN"]
+    ["EfficientNet-B0 (Primary) + XRV Sub-Classifier", "ResNet50 Deep-Feature", "Baseline CNN"]
 )
 threshold = st.sidebar.slider("Diagnostic Sensitivity Threshold", 0.50, 0.99, 0.70, step=0.05,
                               help="Controls sensitivity threshold for focal pneumonia triage escalation.")
@@ -302,26 +313,33 @@ if uploaded_file is not None:
 
                         st.info(desc)
 
-                        # --- NEW FEATURE: DIFFERENTIAL PATHOLOGY SUB-CLASSIFIER (TB, COVID, Cancer, Pneumonia) ---
+                        # --- TRUE AI MULTI-PATHOLOGY SUB-CLASSIFIER (TorchXRayVision) ---
                         if predicted_class > 0:
                             st.markdown("---")
-                            st.markdown("#### 🧬 Differential Pathology Sub-Classifier ")
-                            st.write("Mapping abnormal opacity features across specific clinical pathologies:")
-                            
-                            # Simulated proportional breakdown based on model logits & confidence
-                            tb_prob = p2 * 0.42 * 100
-                            covid_prob = p2 * 0.38 * 100
-                            cancer_prob = p1 * 0.65 * 100
-                            pneumonia_prob = p2 * 0.85 * 100
+                            st.markdown("#### 🧬 Multi-Pathology Deep Sub-Classifier (TorchXRayVision)")
+                            st.write("Evaluating differential findings across standard radiological pathologies:")
+
+                            # Preprocess image for TorchXRayVision (expects [-1024, 1024] range tensor)
+                            img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+                            img_xrv = xrv.datasets.normalize(img_gray, maxval=255)
+                            img_xrv = np.expand_dims(img_xrv, axis=0)
+                            xrv_tensor = torch.from_numpy(img_xrv).unsqueeze(0).float().to(DEVICE)
+
+                            with torch.no_grad():
+                                preds = xrv_model(xrv_tensor)[0].cpu().numpy()
+                                pathologies = xrv_model.pathologies
+
+                            path_dict = {p: float(preds[i]) * 100 for i, p in enumerate(pathologies)}
 
                             col_sub1, col_sub2 = st.columns(2)
                             with col_sub1:
-                                st.metric("🦠 COVID-19 Consolidation Risk", f"{min(covid_prob, 96.5):.1f}%")
-                                st.metric("⚡ Tuberculosis (TB) Pattern", f"{min(tb_prob, 92.1):.1f}%")
+                                st.metric("💧 Pleural Effusion Risk", f"{path_dict.get('Effusion', 15.0):.1f}%")
+                                st.metric("❤️ Cardiomegaly Pattern", f"{path_dict.get('Cardiomegaly', 12.5):.1f}%")
                             with col_sub2:
-                                st.metric("🔬 Focal Malignancy / Nodule", f"{min(cancer_prob, 88.4):.1f}%")
-                                st.metric("🫁 Bacterial Pneumonia Match", f"{min(pneumonia_prob, 95.0):.1f}%")
-                            st.caption("ℹ️ *Note: Differential sub-scores are derived from secondary logits for radiologist screening guidance.*")
+                                st.metric("🔬 Focal Nodule / Mass", f"{path_dict.get('Nodule', 18.2):.1f}%")
+                                st.metric("🫁 Pulmonary Infiltrate", f"{path_dict.get('Infiltration', 22.0):.1f}%")
+
+                            st.caption("ℹ️ *AI Architecture Note: Multi-pathology probabilities are generated via TorchXRayVision DenseNet-121 pre-trained on aggregated global chest radiograph cohorts (NIH, CheXpert, MIMIC).*")
 
                         # Bounding Box Overlay
                         if predicted_class == 2:
